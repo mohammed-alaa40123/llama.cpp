@@ -114,6 +114,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen3(params);
         case LLM_ARCH_QWEN3MOE:
             return new llama_model_qwen3moe(params);
+        case LLM_ARCH_MOBILEMOE:
+            return new llama_model_mobilemoe(params);
         case LLM_ARCH_QWEN3VL:
             return new llama_model_qwen3vl(params);
         case LLM_ARCH_QWEN3VLMOE:
@@ -3520,6 +3522,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_NANBEIGE:
         case LLM_ARCH_POCKETTTS:
+        case LLM_ARCH_MOBILEMOE:
             return LLAMA_ROPE_TYPE_NORM;
         case LLM_ARCH_BAILINGMOE3:
             // VL files carry mrope sections; text-only files keep NORM rope

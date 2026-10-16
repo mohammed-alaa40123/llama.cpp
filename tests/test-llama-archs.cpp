@@ -419,6 +419,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HRM_L_CYCLES,         uint32_t(2));
     }
 
+    if (arch == LLM_ARCH_MOBILEMOE) {
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE, 2.5f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM, true);
+    }
+
     if (arch == LLM_ARCH_MAPLE) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP, 7.0f);
     }
@@ -678,6 +683,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_GROK:
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3MOE:
+        case LLM_ARCH_MOBILEMOE:
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
