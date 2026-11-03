@@ -396,7 +396,11 @@ private:
 
     // Reusable CPU backend dedicated to heterogenous MoE expert branches.
     // Keep separate from the main graph scheduler's backend.
+    // Thread pool and graph allocators persist across layer callbacks: fresh threads and buffers per call
+    // cost 18k page faults per call on the phone.
+    ggml_threadpool_t expert_threadpool = nullptr; // freed in the destructor, after expert_cpu_backend
     ggml_backend_ptr expert_cpu_backend;
+    ggml_gallocr_ptr expert_galloc[2]; // CPU, GPU branch
     uint64_t expert_invocation = 0;
     static bool expert_eval(ggml_tensor * tensor, bool ask, void * data);
 
@@ -421,6 +425,8 @@ private:
     std::string expert_trace_path;
     bool expert_opprof = false;
     bool expert_serial = false; // LLAMA_EP_SERIAL=1: GPU branch, then CPU branch (diagnostic control)
+    int  expert_cpu_threads = 0;    // LLAMA_EP_CPU_THREADS=N: threads of the CPU expert branch (default n_threads)
+    bool expert_cpu_decode = false; // LLAMA_EP_CPU_DECODE=1: CPU branch decodes to F32 + mul_mat (ablation)
     std::vector<expert_trace_call> expert_trace_calls;
     std::vector<expert_trace_op>   expert_trace_ops;
     void expert_trace_write() const;

@@ -145,3 +145,46 @@ python3 scripts/ep/odpm-diff.py RESULTS/NAME
 ```
 
 Raw results: `/home/mohamed/mobilemoe/ep-results/{check-all,drift,perf-pinned2,serial-vs-conc-f0,serial-vs-conc-ff,serial-vs-conc-t3,smoke-nohost3}`.
+
+## Update: CPU expert branch fixed (later on 3 Nov)
+
+`all-cpu` was 3x slower than the normal path. Measured causes, in order of size, and fixes:
+
+1. **Fresh buffers per layer call**: 17.4 M page faults in 37 tokens (normal path: 129 K), ~18 K faults (~72 MB
+   faulted and zeroed) per layer call. Fix: persistent graph allocators per branch (`ggml_gallocr`), CPU branch reads
+   the model weights in place (view, no staging copy), GPU uploads straight from the mapped weights. Faults: 98 K;
+   prep 4.0 -> 0.14 ms, cleanup 6.3 -> 0.03 ms per layer.
+2. **Strided transpose + BF16 cast**: 19.4 of ~32 ms per layer, and the branch got slower from 2 to 4 threads.
+   Fix: CPU custom op `expert_q4_bf16_gemv` computes y = W x from the output-grouped Q4_0 bytes, with a 16-entry
+   BF16 lookup per block (same values as bf16((q-8)*d)); threads split output blocks. `LLAMA_EP_CPU_DECODE=1` keeps
+   the old path for ablation. Expert error vs the BF16 reference: 1.6e-6 (was 3e-7: summation order); no longer
+   bit-identical to the normal path (logits max 0.34, greedy 7/7).
+3. **Two thread pools on the same cores**: llama-completion's polling pool kept spinning while the executor's own
+   pool ran (7 busy threads on 4 cores at -t 4). Fix: the CPU branch uses the context's pool (idle during the
+   callback). `LLAMA_EP_CPU_THREADS=N` sets the branch's thread count.
+
+Comparison, Pixel 7 Pro, pinned clocks (as above), 24 decode tokens, one run per cell, `--no-host`. Per-layer
+medians from the trace; GPU branch still uses the decode path.
+
+| setup | policy | ms/token | layer ms | CPU branch | GPU branch |
+|---|---|---|---|---|---|
+| -t 4 | normal path | 492.8 | - | - | - |
+| -t 4 | all-cpu | **110.9** | 3.3 | 2.8 | - |
+| -t 4 | all-gpu | 521.7 | 14.8 | - | 11.7 |
+| -t 4 | 1+3 | 304.9 | 10.4 | 0.7 | 8.6 |
+| -t 4 | 2+2 | 207.8 | 7.1 | 1.4 | 5.8 |
+| -t 4 | 3+1 | 154.6 | 4.2 | 2.1 | 3.1 |
+| -t 1 | normal path | 1050.7 | - | - | - |
+| -t 1 | all-cpu | 346.6 | 11.8 | 10.7 | - |
+| -t 1 | all-gpu | 458.8 | 15.2 | - | 11.8 |
+| -t 1 | 1+3 | 355.8 | 11.4 | 2.8 | 8.8 |
+| -t 1 | 2+2 | **258.2** | 8.0 | 5.4 | 6.0 |
+| -t 1 | 3+1 | 285.3 | 9.6 | 8.0 | 3.4 |
+| -t 4, branch 1 | all-cpu | 593.3 | 14.9 | 10.7 | - |
+| -t 4, branch 1 | all-gpu | 514.3 | 14.6 | - | 11.5 |
+| -t 4, branch 1 | 2+2 | 521.4 | 8.3 | 5.4 | 6.0 |
+
+With one CPU thread, 2+2 beats both all-cpu and all-gpu (first such case; single runs). With four threads the CPU
+branch is 4x faster than the GPU branch, so every GPU share slows the layer. The "-t 4, branch 1" setup is slower
+than -t 1 overall (not yet explained). Next: the same fused kernel on Vulkan (GPU branch is now the slow side).
+Raw: `/home/mohamed/mobilemoe/ep-results/{cpu-gap-stat,cpu-gap-fix,cpu-gap-prof,cpu-gap-threads,cpu-gap-fused,compare-matrix}`.

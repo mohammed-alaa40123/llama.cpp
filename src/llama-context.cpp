@@ -247,6 +247,12 @@ llama_context::llama_context(
         if (const char * v = getenv("LLAMA_EP_SERIAL")) {
             expert_serial = atoi(v) != 0;
         }
+        if (const char * v = getenv("LLAMA_EP_CPU_THREADS")) {
+            expert_cpu_threads = atoi(v);
+        }
+        if (const char * v = getenv("LLAMA_EP_CPU_DECODE")) {
+            expert_cpu_decode = atoi(v) != 0;
+        }
     }
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
@@ -606,6 +612,14 @@ llama_context::~llama_context() {
     synchronize();
 
     expert_trace_write();
+    for (auto & galloc : expert_galloc) {
+        galloc.reset();
+    }
+    expert_cpu_backend.reset();
+    if (expert_threadpool) {
+        ggml_threadpool_free(expert_threadpool);
+        expert_threadpool = nullptr;
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -2761,6 +2775,56 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
 }
 
+static float expert_bf16_round(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7fffffff) > 0x7f800000) {
+        u = (u | 0x00400000) & 0xffff0000; // quiet NaN
+    } else {
+        u = (u + (0x7fff + ((u >> 16) & 1))) & 0xffff0000; // round to nearest even, as ggml
+    }
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+// y = W x for one output-grouped Q4_0 expert matrix (ne = {n_out, n_in}, blocks run along n_out),
+// with weights rounded to BF16 like the normal MobileMoE path. Threads split the output blocks.
+static void expert_q4_bf16_gemv(ggml_tensor * dst, int ith, int nth, void *) {
+    const ggml_tensor * w = dst->src[0];
+    const float * x = (const float *) dst->src[1]->data;
+    const int64_t qk = ggml_blck_size(GGML_TYPE_Q4_0);
+    const size_t  bs = ggml_type_size(GGML_TYPE_Q4_0);
+    const int64_t n_in = w->ne[1];
+    const int64_t nb = w->ne[0] / qk;
+    const int64_t b0 = nb * ith / nth;
+    const int64_t b1 = nb * (ith + 1) / nth;
+    float * y = (float *) dst->data;
+    std::fill(y + b0*qk, y + b1*qk, 0.0f);
+    float lut[16];
+    float tmp[32];
+    for (int64_t r = 0; r < n_in; ++r) {
+        const float xr = x[r];
+        const uint8_t * row = (const uint8_t *) w->data + r*w->nb[1];
+        for (int64_t blk = b0; blk < b1; ++blk) {
+            const uint8_t * q = row + blk*bs;
+            ggml_fp16_t dh;
+            memcpy(&dh, q, sizeof(dh));
+            const float d = ggml_fp16_to_fp32(dh);
+            for (int v = 0; v < 16; ++v) {
+                lut[v] = expert_bf16_round((float) (v - 8) * d);
+            }
+            for (int j = 0; j < 16; ++j) {
+                tmp[j]      = lut[q[sizeof(dh) + j] & 0x0f];
+                tmp[j + 16] = lut[q[sizeof(dh) + j] >> 4];
+            }
+            float * yb = y + blk*qk;
+            for (int j = 0; j < 32; ++j) {
+                yb[j] += tmp[j] * xr;
+            }
+        }
+    }
+}
+
 bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
     auto & ctx = *static_cast<llama_context *>(data);
     int il;
@@ -2803,12 +2867,31 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
             throw std::runtime_error("expert CPU backend initialization failed");
         }
     }
-    ggml_backend_cpu_set_n_threads(ctx.expert_cpu_backend.get(), ctx.cparams.n_threads);
+    // the main graph is paused during this callback: reuse its thread pool, a second pool would compete for the same cores
+    const int n_ep_threads = ctx.expert_cpu_threads > 0 ? ctx.expert_cpu_threads : (int) ctx.cparams.n_threads;
+    ggml_threadpool_t tp = ctx.threadpool;
+    if (!tp || (int) ctx.cparams.n_threads < n_ep_threads) { // the attached pool has n_threads threads
+        if (!ctx.expert_threadpool) {
+            auto tpp = ggml_threadpool_params_default(n_ep_threads);
+            ctx.expert_threadpool = ggml_threadpool_new(&tpp);
+            if (!ctx.expert_threadpool) {
+                throw std::runtime_error("expert CPU thread pool creation failed");
+            }
+        }
+        tp = ctx.expert_threadpool;
+    }
+    ggml_backend_cpu_set_threadpool(ctx.expert_cpu_backend.get(), tp);
+    ggml_backend_cpu_set_n_threads(ctx.expert_cpu_backend.get(), n_ep_threads);
+    struct upload {
+        ggml_tensor * tensor;
+        const void * src;
+        size_t size;
+        std::vector<uint8_t> owned; // used when the source is not host memory
+    };
     struct branch {
         ggml_context_ptr meta;
-        ggml_backend_buffer_ptr buffer;
         ggml_cgraph * graph;
-        std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> inputs;
+        std::vector<upload> inputs;
         std::vector<std::pair<ggml_tensor *, int64_t>> outputs;
     } branches[2];
     const auto & layer = ctx.model.layers.at(il);
@@ -2835,7 +2918,8 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
             if (gpu[i] != b) {
                 continue;
             }
-            auto weight = [&](ggml_tensor * source, const char * stage) {
+            // y = W in for one expert matrix
+            auto matvec = [&](ggml_tensor * source, ggml_tensor * in, const char * stage) {
                 const int64_t rows = source->ne[0], cols = source->ne[1];
                 // This path consumes output-grouped Q4_0 weights. Each Q4-aligned
                 // matrix row is independently decodable; flattening the whole matrix
@@ -2846,20 +2930,41 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
                     cols > std::numeric_limits<int32_t>::max()) {
                     throw std::runtime_error("unsupported expert matrix shape or quantization");
                 }
-                auto * packed = ggml_new_tensor_2d(meta, source->type, rows, cols);
-                std::vector<uint8_t> bytes(ggml_nbytes(packed));
-                ggml_backend_tensor_get(source, bytes.data(), selected[i]*source->nb[2], bytes.size());
-                branch.inputs.emplace_back(packed, std::move(bytes));
+                const size_t offset = (size_t) selected[i]*source->nb[2];
+                const bool host = source->buffer && ggml_backend_buffer_is_host(source->buffer);
+                ggml_tensor * packed;
+                if (b == 0 && host) {
+                    // CPU branch reads the model weights in place
+                    packed = ggml_view_2d(meta, source, rows, cols, source->nb[1], offset);
+                } else {
+                    packed = ggml_new_tensor_2d(meta, source->type, rows, cols);
+                    ggml_set_input(packed);
+                    upload up = { packed, nullptr, ggml_nbytes(packed), {} };
+                    if (host) {
+                        up.src = (const char *) source->data + offset;
+                    } else {
+                        up.owned.resize(up.size);
+                        ggml_backend_tensor_get(source, up.owned.data(), offset, up.size);
+                    }
+                    branch.inputs.push_back(std::move(up));
+                }
+                if (b == 0 && !ctx.expert_cpu_decode) {
+                    ggml_tensor * args[] = { packed, in };
+                    auto * y = ggml_custom_4d(meta, GGML_TYPE_F32, rows, 1, 1, 1, args, 2, expert_q4_bf16_gemv, GGML_N_TASKS_MAX, nullptr);
+                    ggml_format_name(y, "ep.layer%d.expert%d.slot%lld.%s.gemv", il, selected[i], (long long) i, stage);
+                    return y;
+                }
 
                 // Gather every independent quantization row. The decoded values
                 // and the final matrix orientation are unchanged; only GET_ROWS
                 // parallelism changes. A later fused GEMV can remove this decode.
                 auto * indices = ggml_new_tensor_1d(meta, GGML_TYPE_I32, cols);
-                std::vector<uint8_t> row_bytes((size_t) cols * sizeof(int32_t));
+                ggml_set_input(indices);
+                upload idx = { indices, nullptr, (size_t) cols * sizeof(int32_t), std::vector<uint8_t>((size_t) cols * sizeof(int32_t)) };
                 for (int32_t row = 0; row < (int32_t) cols; ++row) {
-                    std::memcpy(row_bytes.data() + (size_t) row * sizeof(row), &row, sizeof(row));
+                    std::memcpy(idx.owned.data() + (size_t) row * sizeof(row), &row, sizeof(row));
                 }
-                branch.inputs.emplace_back(indices, std::move(row_bytes));
+                branch.inputs.push_back(std::move(idx));
                 auto * decoded = ggml_get_rows(meta, packed, indices);
                 ggml_format_name(decoded, "ep.layer%d.expert%d.slot%lld.%s.decode", il, selected[i], (long long) i, stage);
                 // round to BF16 like the normal MobileMoE path (the GGUF declares BF16 expert materialization)
@@ -2867,33 +2972,34 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
                 ggml_format_name(w, "ep.layer%d.expert%d.slot%lld.%s.bf16", il, selected[i], (long long) i, stage);
                 w = ggml_cast(meta, w, GGML_TYPE_F32);
                 ggml_format_name(w, "ep.layer%d.expert%d.slot%lld.%s.f32", il, selected[i], (long long) i, stage);
-                return w;
+                return ggml_mul_mat(meta, w, in);
             };
-            auto * up = weight(layer.ffn_up_exps, "up");
-            auto * gate = weight(layer.ffn_gate_exps, "gate");
-            auto * down = weight(layer.ffn_down_exps, "down");
             auto * x = ggml_new_tensor_2d(meta, GGML_TYPE_F32, d, 1);
-            branch.inputs.emplace_back(x, std::vector<uint8_t>(d*sizeof(float)));
-            memcpy(branch.inputs.back().second.data(), input.data()+(i/k)*d, d*sizeof(float));
-            auto * up_out = ggml_mul_mat(meta, up, x);
-            auto * gate_out = ggml_mul_mat(meta, gate, x);
+            ggml_set_input(x);
+            branch.inputs.push_back({ x, input.data()+(i/k)*d, d*sizeof(float), {} });
+            auto * up_out = matvec(layer.ffn_up_exps, x, "up");
+            auto * gate_out = matvec(layer.ffn_gate_exps, x, "gate");
             ggml_format_name(up_out, "ep.layer%d.expert%d.slot%lld.up", il, selected[i], (long long) i);
             ggml_format_name(gate_out, "ep.layer%d.expert%d.slot%lld.gate", il, selected[i], (long long) i);
             auto * act = ggml_swiglu_split(meta, gate_out, up_out);
-            auto * out = ggml_mul_mat(meta, down, act);
+            auto * out = matvec(layer.ffn_down_exps, act, "down");
             ggml_format_name(out, "ep.layer%d.expert%d.slot%lld", il, selected[i], (long long) i);
+            ggml_set_output(out);
             ggml_build_forward_expand(branch.graph, out);
             branch.outputs.emplace_back(out, i);
         }
         auto * backend = b ? backend_gpu : ctx.expert_cpu_backend.get();
-        branch.buffer.reset(ggml_backend_alloc_ctx_tensors(meta, backend));
-        if (!branch.buffer) {
+        auto & galloc = ctx.expert_galloc[b];
+        if (!galloc) {
+            galloc.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)));
+        }
+        if (!ggml_gallocr_alloc_graph(galloc.get(), branch.graph)) {
             throw std::runtime_error("expert backend allocation failed");
         }
         for (auto & in : branch.inputs) {
-            ggml_backend_tensor_set(in.first, in.second.data(), 0, in.second.size());
-            (b ? tr.bytes_gpu : tr.bytes_cpu) += in.second.size();
-            LLAMA_LOG_DEBUG("ep_upload layer=%d backend=%s type=%s bytes=%zu\n", il, ggml_backend_name(backend), ggml_type_name(in.first->type), in.second.size());
+            ggml_backend_tensor_set(in.tensor, in.src ? in.src : in.owned.data(), 0, in.size);
+            (b ? tr.bytes_gpu : tr.bytes_cpu) += in.size;
+            LLAMA_LOG_DEBUG("ep_upload layer=%d backend=%s type=%s bytes=%zu\n", il, ggml_backend_name(backend), ggml_type_name(in.tensor->type), in.size);
         }
         for (int i = 0; i < ggml_graph_n_nodes(branch.graph); ++i) {
             auto * op = ggml_graph_node(branch.graph, i);
@@ -2979,7 +3085,6 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
     ggml_backend_tensor_set(tensor, output.data(), 0, output.size()*sizeof(float));
     tr.t_out = ggml_time_us();
     for (auto & branch : branches) {
-        branch.buffer.reset();
         branch.meta.reset();
     }
     tr.t_cleanup = ggml_time_us();
@@ -3014,8 +3119,8 @@ void llama_context::expert_trace_write() const {
     }
     // realtime offset, to align with samplers that use wall clock time
     const int64_t real_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    fprintf(f, "# clock=CLOCK_MONOTONIC_us opprof=%d serial=%d n_threads=%u realtime_minus_monotonic_us=%" PRId64 "\n",
-        expert_opprof ? 1 : 0, expert_serial ? 1 : 0, cparams.n_threads, real_us - ggml_time_us());
+    fprintf(f, "# clock=CLOCK_MONOTONIC_us opprof=%d serial=%d cpu_decode=%d n_threads=%u ep_cpu_threads=%d realtime_minus_monotonic_us=%" PRId64 "\n",
+        expert_opprof ? 1 : 0, expert_serial ? 1 : 0, expert_cpu_decode ? 1 : 0, cparams.n_threads, expert_cpu_threads, real_us - ggml_time_us());
     fprintf(f, "invocation,layer,n_tokens,top_k,n_cpu,n_gpu,t_enter,t_policy,t_prep_cpu,t_prep_gpu,bytes_cpu,bytes_gpu,"
         "t_gpu_submit0,t_gpu_submit1,t_gpu_sync,t_gpu_read,t_cpu0,t_cpu1,t_cpu_read,t_join,t_out,t_cleanup,assignment\n");
     for (const auto & c : expert_trace_calls) {
