@@ -24,9 +24,10 @@ struct block_q4_0
 //------------------------------------------------------------------------------
 void dequantize_q4_0_f32(global struct block_q4_0 * xb, short il, float16 * reg) {
     global ushort * qs = ((global ushort *)xb + 1);
-    float d1 = il ? (xb->d / 16.h) : xb->d;
+    const float scale = xb->d;
+    float d1 = il ? scale / 16.f : scale;
     float d2 = d1 / 256.f;
-    float md = -8.h * xb->d;
+    float md = -8.f * scale;
     ushort mask0 = il ? 0x00F0 : 0x000F;
     ushort mask1 = mask0 << 8;
 
@@ -96,6 +97,53 @@ kernel void kernel_get_rows_f32(
 
     global float * dst_row = (global float *) ((global char *) dst  + i12*nb3 + i11*nb2 + i10*nb1);
     global float * src_row = (global float *) ((global char *) src0 + r*nb01 + i02*nb02 + i03*nb03);
+
+    int span  = (ne00 + nchunks - 1) / nchunks;
+    int start = chunk * span;
+    int end   = min(start + span, ne00);
+
+    for (int ind = start + get_local_id(0); ind < end; ind += get_local_size(0)) {
+        dst_row[ind] = src_row[ind];
+    }
+}
+
+kernel void kernel_get_rows_i32(
+        global void * src0,
+        ulong offset0,
+        global int * src1,
+        ulong offset1,
+        global int * dst,
+        ulong offsetd,
+        int ne00,
+        ulong nb01,
+        ulong nb02,
+        ulong nb03,
+        int ne10,
+        ulong nb10,
+        ulong nb11,
+        ulong nb12,
+        ulong nb1,
+        ulong nb2,
+        ulong nb3
+) {
+    src0 = (global void*)((global char*)src0 + offset0);
+    src1 = (global int*)((global char*)src1 + offset1);
+    dst = (global int*)((global char*)dst + offsetd);
+
+    int nchunks = get_num_groups(0) / ne10;
+    int g       = get_group_id(0);
+    int i10     = g / nchunks;
+    int chunk   = g - i10 * nchunks;
+    int i11     = get_group_id(1);
+    int i12     = get_group_id(2);
+
+    int r = ((global int *) ((global char *) src1 + i12*nb12 + i11*nb11 + i10*nb10))[0];
+
+    int i02 = i11;
+    int i03 = i12;
+
+    global int * dst_row = (global int *) ((global char *) dst  + i12*nb3 + i11*nb2 + i10*nb1);
+    global int * src_row = (global int *) ((global char *) src0 + r*nb01 + i02*nb02 + i03*nb03);
 
     int span  = (ne00 + nchunks - 1) / nchunks;
     int start = chunk * span;

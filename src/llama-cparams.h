@@ -48,6 +48,8 @@ struct llama_cparams {
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool fused_top_k_mask;   // use fused top-k sparse attention mask
+    bool auto_ftkm;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
@@ -65,6 +67,8 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+    llama_expert_callback cb_expert;
+    void * cb_expert_user_data;
 
     llama_context * ctx_other;
 };
