@@ -393,6 +393,10 @@ private:
     int32_t n_reallocs_diff = 0;
 
     ggml_backend_t backend_cpu = nullptr;
+
+    // Reusable CPU backend dedicated to heterogenous MoE expert branches.
+    // Keep separate from the main graph scheduler's backend.
+    ggml_backend_ptr expert_cpu_backend;
     uint64_t expert_invocation = 0;
     static bool expert_eval(ggml_tensor * tensor, bool ask, void * data);
 
