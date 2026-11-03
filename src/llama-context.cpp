@@ -17,6 +17,7 @@
 #include "ggml-cpu.h"
 #include <thread>
 #include <future>
+#include <exception>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -2775,7 +2776,7 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
         if (gpu[i] > 1 || selected[i] < 0 || uint32_t(selected[i]) >= ctx.model.hparams.n_expert || (gpu[i] && !backend_gpu)) {
             throw std::runtime_error("invalid expert assignment or unavailable GPU");
         }
-        LLAMA_LOG_INFO("ep_route layer=%d token=%lld slot=%lld expert=%d backend=%s\n", il,
+        LLAMA_LOG_DEBUG("ep_route layer=%d token=%lld slot=%lld expert=%d backend=%s\n", il,
             (long long) (i/k), (long long) (i%k), selected[i], gpu[i] ? ggml_backend_name(backend_gpu) : "CPU");
     }
     ggml_backend_ptr cpu(ggml_backend_cpu_init());
@@ -2808,18 +2809,33 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
             if (gpu[i] != b) {
                 continue;
             }
-            auto * zero = ggml_new_tensor_1d(meta, GGML_TYPE_I32, 1);
-            branch.inputs.emplace_back(zero, std::vector<uint8_t>(sizeof(int32_t), 0));
             auto weight = [&](ggml_tensor * source, const char * stage) {
                 const int64_t rows = source->ne[0], cols = source->ne[1];
-                auto * storage = ggml_new_tensor_1d(meta, source->type, rows*cols);
-                auto * packed = ggml_view_2d(meta, storage, rows*cols, 1, ggml_nbytes(storage), 0);
+                // This path consumes output-grouped Q4_0 weights. Each Q4-aligned
+                // matrix row is independently decodable; flattening the whole matrix
+                // into one GET_ROWS row serialized CPU decoding and launched only
+                // one GPU workgroup, even for a large expert.
+                if (source->type != GGML_TYPE_Q4_0 || rows <= 0 || cols <= 0 ||
+                    rows % ggml_blck_size(source->type) != 0 ||
+                    cols > std::numeric_limits<int32_t>::max()) {
+                    throw std::runtime_error("unsupported expert matrix shape or quantization");
+                }
+                auto * packed = ggml_new_tensor_2d(meta, source->type, rows, cols);
                 std::vector<uint8_t> bytes(ggml_nbytes(packed));
                 ggml_backend_tensor_get(source, bytes.data(), selected[i]*source->nb[2], bytes.size());
                 branch.inputs.emplace_back(packed, std::move(bytes));
-                auto * decoded = ggml_get_rows(meta, packed, zero);
+
+                // Gather every independent quantization row. The decoded values
+                // and the final matrix orientation are unchanged; only GET_ROWS
+                // parallelism changes. A later fused GEMV can remove this decode.
+                auto * indices = ggml_new_tensor_1d(meta, GGML_TYPE_I32, cols);
+                std::vector<uint8_t> row_bytes((size_t) cols * sizeof(int32_t));
+                for (int32_t row = 0; row < (int32_t) cols; ++row) {
+                    std::memcpy(row_bytes.data() + (size_t) row * sizeof(row), &row, sizeof(row));
+                }
+                branch.inputs.emplace_back(indices, std::move(row_bytes));
+                auto * decoded = ggml_get_rows(meta, packed, indices);
                 ggml_format_name(decoded, "ep.layer%d.expert%d.slot%lld.%s.decode", il, selected[i], (long long) i, stage);
-                decoded = ggml_reshape_2d(meta, decoded, rows, cols);
                 return ggml_cont(meta, ggml_transpose(meta, decoded));
             };
             auto * up = weight(layer.ffn_up_exps, "up");
@@ -2845,7 +2861,7 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
         }
         for (auto & in : branch.inputs) {
             ggml_backend_tensor_set(in.first, in.second.data(), 0, in.second.size());
-            LLAMA_LOG_INFO("ep_upload layer=%d backend=%s type=%s bytes=%zu\n", il, ggml_backend_name(backend), ggml_type_name(in.first->type), in.second.size());
+            LLAMA_LOG_DEBUG("ep_upload layer=%d backend=%s type=%s bytes=%zu\n", il, ggml_backend_name(backend), ggml_type_name(in.first->type), in.second.size());
         }
         for (int i = 0; i < ggml_graph_n_nodes(branch.graph); ++i) {
             if (!ggml_backend_supports_op(backend, ggml_graph_node(branch.graph, i))) {
@@ -2854,31 +2870,49 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
         }
     }
     ggml_status status[2] = { GGML_STATUS_SUCCESS, GGML_STATUS_SUCCESS };
+    std::exception_ptr errors[2] = {};
     std::promise<void> submitted;
     auto ready = submitted.get_future();
     auto run = [&](int b) {
-        auto & branch = branches[b];
-        if (branch.outputs.empty()) {
-            if (b) { submitted.set_value(); }
-            return;
-        }
-        auto * backend = b ? backend_gpu : cpu.get();
-        const int64_t start = ggml_time_us();
-        status[b] = ggml_backend_graph_compute_async(backend, branch.graph);
-        if (b) { submitted.set_value(); }
-        ggml_backend_synchronize(backend);
-        const int64_t end = ggml_time_us();
-        LLAMA_LOG_INFO("ep_execute layer=%d backend=%s start_us=%lld end_us=%lld\n", il, ggml_backend_name(backend), (long long) start, (long long) end);
-        for (auto & out : branch.outputs) {
-            ggml_backend_tensor_get(out.first, output.data()+out.second*d, 0, d*sizeof(float));
+        bool signaled = false;
+        auto signal_submission = [&]() {
+            if (b && !signaled) {
+                submitted.set_value();
+                signaled = true;
+            }
+        };
+        try {
+            auto & branch = branches[b];
+            if (branch.outputs.empty()) {
+                signal_submission();
+                return;
+            }
+            auto * backend = b ? backend_gpu : cpu.get();
+            const int64_t start = ggml_time_us();
+            status[b] = ggml_backend_graph_compute_async(backend, branch.graph);
+            signal_submission();
+            if (status[b] != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("expert branch graph execution failed");
+            }
+            ggml_backend_synchronize(backend);
+            const int64_t end = ggml_time_us();
+            LLAMA_LOG_DEBUG("ep_execute layer=%d backend=%s start_us=%lld end_us=%lld\n", il, ggml_backend_name(backend), (long long) start, (long long) end);
+            for (auto & out : branch.outputs) {
+                ggml_backend_tensor_get(out.first, output.data()+out.second*d, 0, d*sizeof(float));
+            }
+        } catch (...) {
+            errors[b] = std::current_exception();
+            signal_submission(); // Never leave the main thread waiting if GPU setup fails.
         }
     };
     std::thread gpu_worker([&]() { run(1); });
     ready.wait();
     run(0);
-    gpu_worker.join();
-    if (status[0] != GGML_STATUS_SUCCESS || status[1] != GGML_STATUS_SUCCESS) {
-        throw std::runtime_error("expert branch execution failed");
+    gpu_worker.join(); // Always join before propagating either branch's failure.
+    for (const auto & error : errors) {
+        if (error) {
+            std::rethrow_exception(error);
+        }
     }
     ggml_backend_tensor_set(tensor, output.data(), 0, output.size()*sizeof(float));
     return true;
