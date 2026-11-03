@@ -4549,7 +4549,8 @@ vk_device ggml_vk_get_device(size_t idx) {
                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
 
         device->shader_int64 = device_features2.features.shaderInt64;
-        device->buffer_device_address = vk12_features.bufferDeviceAddress;
+        // core vkGetBufferDeviceAddress needs a Vulkan 1.2 device; Mali-G710 on Android 13 reports 1.1 and crashes on the call
+        device->buffer_device_address = vk12_features.bufferDeviceAddress && device->properties.apiVersion >= VK_API_VERSION_1_2;
         device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
 
         if (device->subgroup_size_control) {
