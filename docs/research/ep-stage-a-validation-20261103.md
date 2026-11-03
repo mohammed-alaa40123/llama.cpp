@@ -144,7 +144,7 @@ python3 scripts/ep/trace-summary.py RESULTS/NAME/trace-*.csv
 python3 scripts/ep/odpm-diff.py RESULTS/NAME
 ```
 
-Raw results: `/home/mohamed/mobilemoe/ep-results/{check-all,drift,perf-pinned2,serial-vs-conc-f0,serial-vs-conc-ff,serial-vs-conc-t3,smoke-nohost3}`.
+Raw results: [results/2026-11-03-ep-stage-a](results/2026-11-03-ep-stage-a/) (`check-all`, `drift`, `perf-pinned2`, `serial-vs-conc-*`, `smoke-nohost3`; index in its README).
 
 ## Update: CPU expert branch fixed (later on 3 Nov)
 
@@ -187,4 +187,4 @@ medians from the trace; GPU branch still uses the decode path.
 With one CPU thread, 2+2 beats both all-cpu and all-gpu (first such case; single runs). With four threads the CPU
 branch is 4x faster than the GPU branch, so every GPU share slows the layer. The "-t 4, branch 1" setup is slower
 than -t 1 overall (not yet explained). Next: the same fused kernel on Vulkan (GPU branch is now the slow side).
-Raw: `/home/mohamed/mobilemoe/ep-results/{cpu-gap-stat,cpu-gap-fix,cpu-gap-prof,cpu-gap-threads,cpu-gap-fused,compare-matrix}`.
+Raw: [results/2026-11-03-ep-stage-a](results/2026-11-03-ep-stage-a/) (`cpu-gap-*`, `compare-matrix`).

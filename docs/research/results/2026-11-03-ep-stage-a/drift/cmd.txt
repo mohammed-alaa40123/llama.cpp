@@ -1,0 +1,1 @@
+cd $OUT && $BIN/llama-ep-check -m $MODEL -t 4 --no-repack --no-host -ngl 0 --device Vulkan0 --policies all-cpu,all-gpu,cpu-first-2,none --steps 1 --out $OUT

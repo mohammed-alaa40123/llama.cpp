@@ -1,0 +1,1 @@
+cd $OUT && for h in "" "--no-host"; do echo "== host=$h"; $BIN/llama-completion -m $MODEL -t 4 --no-repack -ngl 0 $h -n 8 -p "The capital of France is" --temp 0 -no-cnv 2>&1 | grep -E "eval time|buffer size|Paris"; done

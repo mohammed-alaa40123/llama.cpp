@@ -1,0 +1,15 @@
+ggml_vulkan: WARNING: Instance extension VK_EXT_debug_utils not found.
+0.00.227.143 W load: special_eom_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.17.659.999 W ~llama_context:        CPU compute buffer size of 192.1204 MiB, does not match expectation of  32.0202 MiB
+
+policy            cpu_n    cpu_f32   cpu_bf16    gpu_n    gpu_f32   gpu_bf16  plain_n     pl_f32    pl_bf16   lgt_max   lgt_rms  argmax   l0_diff  hid_diff
+none                  0   0.00e+00   0.00e+00        0   0.00e+00   0.00e+00     1228   5.31e-03   3.13e-07  0.00e+00  0.00e+00   7/7    0.00e+00  0.00e+00
+all-cpu            1228   5.31e-03   1.63e-06        0   0.00e+00   0.00e+00        0   0.00e+00   0.00e+00  3.40e-01  4.93e-02   7/7    1.34e-05  4.76e-01
+all-gpu               0   0.00e+00   0.00e+00     1228   5.31e-03   3.08e-07        0   0.00e+00   0.00e+00  7.77e-01  6.81e-02   7/7    3.81e-06  1.08e+00
+cpu-first-2         614   5.31e-03   1.31e-06      614   3.68e-03   3.15e-07        0   0.00e+00   0.00e+00  4.98e-01  6.73e-02   7/7    1.34e-05  6.90e-01
+rotating            815   3.51e-03   1.43e-06      413   5.31e-03   2.55e-07        0   0.00e+00   0.00e+00  3.09e-01  4.29e-02   7/7    3.81e-06  4.30e-01
+
+rel_l2 columns: worst relative L2 error of one expert output vs the double reference with F32 or BF16 weights
+lgt_*: logits vs none on the same tokens; l0_diff: max abs diff of layer 0 expert outputs vs none
+hid_diff: max abs diff of the final normed hidden state (input of the output matmul) vs none
+wrote /data/local/tmp/ep/runs/cpu-gap-fused/ep-check.json

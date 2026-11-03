@@ -1,0 +1,1 @@
+cd $OUT && $BIN/llama-cli --list-devices; for o in GET_ROWS CPY GLU; do $BIN/test-backend-ops -b Vulkan0 -o $o 2>&1 | grep -E "FAIL|OK|Testing|tests passed|not supported" | grep -v " OK$" ; done; $BIN/test-backend-ops -b Vulkan0 -o MUL_MAT -p "type_a=f32,type_b=f32" 2>&1 | grep -E "FAIL|tests passed"

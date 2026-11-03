@@ -1,0 +1,1 @@
+cd $OUT && for h in "--no-host"; do for p in none all-cpu all-gpu; do echo "== host=$h policy=$p"; e=""; [ $p != none ] && e="--expert-policy $p"; $BIN/llama-completion -m $MODEL -t 4 --no-repack -ngl 0 --device Vulkan0 $h $e -n 8 -p "The capital of France is" --temp 0 -no-cnv 2>&1 | grep -E "eval time|compute buffer size|Paris"; done; done

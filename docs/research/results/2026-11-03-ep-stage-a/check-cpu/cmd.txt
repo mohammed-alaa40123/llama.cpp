@@ -1,0 +1,1 @@
+cd $OUT && $BIN/llama-ep-check -m $MODEL -t 4 --no-repack -ngl 0 --policies none,all-cpu --steps 4 --out $OUT

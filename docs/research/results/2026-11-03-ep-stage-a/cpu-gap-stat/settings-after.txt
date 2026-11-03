@@ -1,0 +1,51 @@
+policy0 gov=sched_pixel min=300000 max=1803000
+policy4 gov=sched_pixel min=400000 max=2348000
+policy6 gov=sched_pixel min=500000 max=2850000
+gpu min=151000 max=848000 policy=coarse_demand [adaptive] always_on 
+mif min=421000 max=3172000
+thermal BIG=42000
+thermal MID=41000
+thermal battery_cycle=659
+thermal pmic_120c=
+thermal pmic_140c=
+thermal pmic_overheat=
+thermal soc=99
+thermal smpl_gm=0
+thermal ocp_cpu1=0
+thermal ocp_cpu2=0
+thermal soft_ocp_cpu1=0
+thermal soft_ocp_cpu2=0
+thermal LITTLE=41000
+thermal ocp_tpu=0
+thermal soft_ocp_tpu=0
+thermal ocp_gpu=0
+thermal soft_ocp_gpu=0
+thermal cp_on_chip_0=
+thermal cp_on_chip_1=
+thermal cp_on_chip_2=
+thermal cp_on_chip_3=
+thermal cp_on_chip_4=
+thermal cp_on_chip_5=
+thermal G3D=39000
+thermal cp_on_chip_6=
+thermal rf2_therm=
+thermal rf1_therm=
+thermal neutral_therm=28478
+thermal quiet_therm=27632
+thermal qi_therm=32128
+thermal usb_pwr_therm=26612
+thermal usb_pwr_therm2=26987
+thermal disp_therm=24457
+thermal batt_therm_sidekey=-26428
+thermal ISP=39000
+thermal gnss_tcxo_therm=32240
+thermal battery=-34700
+thermal maxfg=-34700
+thermal pca94xx-mains=3100
+thermal usbc-therm-adc=900
+thermal batt_vs=-34709
+thermal TPU=39000
+thermal AUR=39000
+thermal batoilo=0
+thermal vdroop1=0
+thermal vdroop2=0

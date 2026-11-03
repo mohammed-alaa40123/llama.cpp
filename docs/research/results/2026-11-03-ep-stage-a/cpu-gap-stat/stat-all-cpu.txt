@@ -1,0 +1,37 @@
+ggml_vulkan: WARNING: Instance extension VK_EXT_debug_utils not found.
+0.00.028.523 I llama_completion: llama backend init
+0.00.028.543 I llama_completion: load the model and apply lora adapter, if any
+0.00.539.096 W load: special_eom_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.00.802.810 I cmn          init: llama threadpool init, n_threads = 4
+0.05.143.788 I 
+0.05.143.971 I system_info: n_threads = 4 (n_threads_batch = 4) / 8 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | LLAMAFILE = 1 | REPACK = 1 | 
+0.05.143.979 I 
+0.05.144.114 I sampler seed: 4294967295
+0.05.144.135 I sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 40, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.05.144.149 I sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> greedy 
+0.05.144.150 I generate: n_ctx = 8192, n_batch = 2048, n_predict = 32, n_keep = 1
+0.05.144.150 I 
+The capital of France is Paris. Paris is a city in France. Paris is the capital of France. Paris is the capital of France. Paris is the capital of France. Paris is
+
+2.19.148.180 I common_perf_print:    sampling time =      10.62 ms
+2.19.148.183 I common_perf_print:    samplers time =       3.97 ms /    38 tokens
+2.19.148.185 I common_perf_print:        load time =    4759.11 ms
+2.19.148.187 I common_perf_print: prompt eval time =    7174.08 ms /     6 tokens ( 1195.68 ms per token,     0.84 tokens per second)
+2.19.148.190 I common_perf_print:        eval time =  126816.37 ms /    31 runs   ( 4090.85 ms per token,     0.24 tokens per second)
+2.19.148.194 I common_perf_print:       total time =  134004.40 ms /    37 tokens
+2.19.148.213 I common_perf_print: unaccounted time =       3.33 ms /   0.0 %      (total - sampling - prompt eval - eval) / (total)
+2.19.148.214 I common_perf_print:    graphs reused =         30
+2.19.148.215 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+Performance counter statistics:
+
+#             count  event_name         # count / runtime,  runtime / enabled_time
+  417057.368435(ms)  task-clock         # 2.992606 cpus used  (100%)
+         17,381,843  page-faults        # 41.677 K/sec        (100%)
+             57,797  context-switches   # 138.583 /sec        (100%)
+              9,742  cpu-migrations     # 23.359 /sec         (100%)
+
+Total test time: 139.362598 seconds.

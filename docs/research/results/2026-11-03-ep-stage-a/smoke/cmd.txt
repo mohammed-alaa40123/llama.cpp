@@ -1,0 +1,1 @@
+cd $OUT && $BIN/llama-completion -m $MODEL -t 4 --no-repack -ngl 0 -n 8 -p "The capital of France is" --temp 0 -no-cnv; echo; echo ===; $BIN/llama-completion -m $MODEL -t 4 --no-repack -ngl 0 --device Vulkan0 --expert-policy all-gpu -n 8 -p "The capital of France is" --temp 0 -no-cnv
