@@ -16,6 +16,7 @@
 
 #include "ggml-cpu.h"
 #include <thread>
+#include <chrono>
 #include <future>
 #include <exception>
 #include <cinttypes>
@@ -236,6 +237,17 @@ llama_context::llama_context(
 
     cparams.cb_expert           = params.cb_expert;
     cparams.cb_expert_user_data = params.cb_expert_user_data;
+    if (cparams.cb_expert) {
+        if (const char * path = getenv("LLAMA_EP_TRACE")) {
+            expert_trace_path = path;
+        }
+        if (const char * v = getenv("LLAMA_EP_OPPROF")) {
+            expert_opprof = atoi(v) != 0;
+        }
+        if (const char * v = getenv("LLAMA_EP_SERIAL")) {
+            expert_serial = atoi(v) != 0;
+        }
+    }
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
@@ -592,6 +604,8 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    expert_trace_write();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -2756,6 +2770,8 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
     if (ask) {
         return true;
     }
+    expert_trace_call tr = {};
+    tr.t_enter = ggml_time_us();
     const auto * ids = tensor->src[1];
     const int64_t k = ids->ne[0], n = ids->ne[1], d = tensor->ne[0];
     std::vector<int32_t> selected(k*n);
@@ -2779,6 +2795,8 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
         LLAMA_LOG_DEBUG("ep_route layer=%d token=%lld slot=%lld expert=%d backend=%s\n", il,
             (long long) (i/k), (long long) (i%k), selected[i], gpu[i] ? ggml_backend_name(backend_gpu) : "CPU");
     }
+    const bool trace = !ctx.expert_trace_path.empty();
+    tr.t_policy = ggml_time_us();
     if (!ctx.expert_cpu_backend) {
         ctx.expert_cpu_backend.reset(ggml_backend_cpu_init());
         if (!ctx.expert_cpu_backend) {
@@ -2795,6 +2813,9 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
     } branches[2];
     const auto & layer = ctx.model.layers.at(il);
     for (int b = 0; b < 2; ++b) {
+        if (b == 1) {
+            tr.t_prep_cpu = ggml_time_us();
+        }
         auto & branch = branches[b];
         int64_t count = 0;
         for (auto assignment : gpu) {
@@ -2804,7 +2825,7 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
             continue;
         }
         const size_t nodes = 48*count + 16;
-        branch.meta.reset(ggml_init({ nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(nodes, false), nullptr, true }));
+        branch.meta.reset(ggml_init({ nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(nodes, false) + ggml_graph_overhead_custom(1, false), nullptr, true }));
         if (!branch.meta) {
             throw std::runtime_error("expert graph allocation failed");
         }
@@ -2841,7 +2862,12 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
                 branch.inputs.emplace_back(indices, std::move(row_bytes));
                 auto * decoded = ggml_get_rows(meta, packed, indices);
                 ggml_format_name(decoded, "ep.layer%d.expert%d.slot%lld.%s.decode", il, selected[i], (long long) i, stage);
-                return ggml_cont(meta, ggml_transpose(meta, decoded));
+                // round to BF16 like the normal MobileMoE path (the GGUF declares BF16 expert materialization)
+                auto * w = ggml_cast(meta, ggml_transpose(meta, decoded), GGML_TYPE_BF16);
+                ggml_format_name(w, "ep.layer%d.expert%d.slot%lld.%s.bf16", il, selected[i], (long long) i, stage);
+                w = ggml_cast(meta, w, GGML_TYPE_F32);
+                ggml_format_name(w, "ep.layer%d.expert%d.slot%lld.%s.f32", il, selected[i], (long long) i, stage);
+                return w;
             };
             auto * up = weight(layer.ffn_up_exps, "up");
             auto * gate = weight(layer.ffn_gate_exps, "gate");
@@ -2866,6 +2892,7 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
         }
         for (auto & in : branch.inputs) {
             ggml_backend_tensor_set(in.first, in.second.data(), 0, in.second.size());
+            (b ? tr.bytes_gpu : tr.bytes_cpu) += in.second.size();
             LLAMA_LOG_DEBUG("ep_upload layer=%d backend=%s type=%s bytes=%zu\n", il, ggml_backend_name(backend), ggml_type_name(in.first->type), in.second.size());
         }
         for (int i = 0; i < ggml_graph_n_nodes(branch.graph); ++i) {
@@ -2879,7 +2906,9 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
             }
         }
     }
+    tr.t_prep_gpu = ggml_time_us();
     ggml_status status[2] = { GGML_STATUS_SUCCESS, GGML_STATUS_SUCCESS };
+    int64_t t_run[2][4] = {}; // submit begin, submit end, sync end, output read end
     std::exception_ptr errors[2] = {};
     std::promise<void> submitted;
     auto ready = submitted.get_future();
@@ -2899,33 +2928,119 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
             }
             auto * backend = b ? backend_gpu : ctx.expert_cpu_backend.get();
             const int64_t start = ggml_time_us();
-            status[b] = ggml_backend_graph_compute_async(backend, branch.graph);
+            t_run[b][0] = start;
+            if (ctx.expert_opprof) {
+                // one op per compute call; slow, serializes host and device
+                auto * single = ggml_new_graph_custom(branch.meta.get(), 1, false);
+                for (int j = 0; j < ggml_graph_n_nodes(branch.graph) && status[b] == GGML_STATUS_SUCCESS; ++j) {
+                    auto * node = ggml_graph_node(branch.graph, j);
+                    ggml_graph_clear(single);
+                    ggml_graph_add_node(single, node);
+                    const int64_t t0 = ggml_time_us();
+                    status[b] = ggml_backend_graph_compute(backend, single);
+                    ctx.expert_trace_ops.push_back({ ctx.expert_invocation - 1, il, b, j, t0, ggml_time_us(), ggml_op_desc(node), node->name });
+                }
+            } else {
+                status[b] = ggml_backend_graph_compute_async(backend, branch.graph);
+            }
+            t_run[b][1] = ggml_time_us();
             signal_submission();
             if (status[b] != GGML_STATUS_SUCCESS) {
                 throw std::runtime_error("expert branch graph execution failed");
             }
             ggml_backend_synchronize(backend);
             const int64_t end = ggml_time_us();
+            t_run[b][2] = end;
             LLAMA_LOG_DEBUG("ep_execute layer=%d backend=%s start_us=%lld end_us=%lld\n", il, ggml_backend_name(backend), (long long) start, (long long) end);
             for (auto & out : branch.outputs) {
                 ggml_backend_tensor_get(out.first, output.data()+out.second*d, 0, d*sizeof(float));
             }
+            t_run[b][3] = ggml_time_us();
         } catch (...) {
             errors[b] = std::current_exception();
             signal_submission(); // Never leave the main thread waiting if GPU setup fails.
         }
     };
-    std::thread gpu_worker([&]() { run(1); });
-    ready.wait();
-    run(0);
-    gpu_worker.join(); // Always join before propagating either branch's failure.
+    if (ctx.expert_opprof || ctx.expert_serial) {
+        run(1);
+        run(0);
+    } else {
+        std::thread gpu_worker([&]() { run(1); });
+        ready.wait();
+        run(0);
+        gpu_worker.join(); // Always join before propagating either branch's failure.
+    }
+    tr.t_join = ggml_time_us();
     for (const auto & error : errors) {
         if (error) {
             std::rethrow_exception(error);
         }
     }
     ggml_backend_tensor_set(tensor, output.data(), 0, output.size()*sizeof(float));
+    tr.t_out = ggml_time_us();
+    for (auto & branch : branches) {
+        branch.buffer.reset();
+        branch.meta.reset();
+    }
+    tr.t_cleanup = ggml_time_us();
+    if (trace) {
+        tr.invocation = ctx.expert_invocation - 1;
+        tr.layer = il;
+        tr.n_tokens = (int32_t) n;
+        tr.top_k = (int32_t) k;
+        for (int64_t i = 0; i < k*n; ++i) {
+            (gpu[i] ? tr.n_gpu : tr.n_cpu)++;
+            tr.assignment += (i ? " " : "") + std::to_string(selected[i]) + (gpu[i] ? "g" : "c");
+        }
+        tr.t_cpu0 = t_run[0][0]; tr.t_cpu1 = t_run[0][2]; tr.t_cpu_read = t_run[0][3];
+        tr.t_gpu_submit0 = t_run[1][0]; tr.t_gpu_submit1 = t_run[1][1]; tr.t_gpu_sync = t_run[1][2]; tr.t_gpu_read = t_run[1][3];
+        ctx.expert_trace_calls.push_back(std::move(tr));
+    }
+    // let a cb_eval hook (e.g. a numerical checker) see the expert outputs
+    if (ctx.cparams.cb_eval && ctx.cparams.cb_eval(tensor, true, ctx.cparams.cb_eval_user_data)) {
+        ctx.cparams.cb_eval(tensor, false, ctx.cparams.cb_eval_user_data);
+    }
     return true;
+}
+
+void llama_context::expert_trace_write() const {
+    if (expert_trace_path.empty()) {
+        return;
+    }
+    FILE * f = fopen(expert_trace_path.c_str(), "w");
+    if (!f) {
+        LLAMA_LOG_ERROR("%s: cannot open %s\n", __func__, expert_trace_path.c_str());
+        return;
+    }
+    // realtime offset, to align with samplers that use wall clock time
+    const int64_t real_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    fprintf(f, "# clock=CLOCK_MONOTONIC_us opprof=%d serial=%d n_threads=%u realtime_minus_monotonic_us=%" PRId64 "\n",
+        expert_opprof ? 1 : 0, expert_serial ? 1 : 0, cparams.n_threads, real_us - ggml_time_us());
+    fprintf(f, "invocation,layer,n_tokens,top_k,n_cpu,n_gpu,t_enter,t_policy,t_prep_cpu,t_prep_gpu,bytes_cpu,bytes_gpu,"
+        "t_gpu_submit0,t_gpu_submit1,t_gpu_sync,t_gpu_read,t_cpu0,t_cpu1,t_cpu_read,t_join,t_out,t_cleanup,assignment\n");
+    for (const auto & c : expert_trace_calls) {
+        fprintf(f, "%" PRIu64 ",%d,%d,%d,%d,%d,%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%zu,%zu,"
+            "%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%s\n",
+            c.invocation, c.layer, c.n_tokens, c.top_k, c.n_cpu, c.n_gpu, c.t_enter, c.t_policy, c.t_prep_cpu, c.t_prep_gpu,
+            c.bytes_cpu, c.bytes_gpu, c.t_gpu_submit0, c.t_gpu_submit1, c.t_gpu_sync, c.t_gpu_read, c.t_cpu0, c.t_cpu1,
+            c.t_cpu_read, c.t_join, c.t_out, c.t_cleanup, c.assignment.c_str());
+    }
+    fclose(f);
+    if (expert_trace_ops.empty()) {
+        return;
+    }
+    const std::string ops_path = expert_trace_path + ".ops.csv";
+    f = fopen(ops_path.c_str(), "w");
+    if (!f) {
+        LLAMA_LOG_ERROR("%s: cannot open %s\n", __func__, ops_path.c_str());
+        return;
+    }
+    fprintf(f, "# clock=CLOCK_MONOTONIC_us; each op computed and synchronized alone\n");
+    fprintf(f, "invocation,layer,gpu,node,t0,t1,op,name\n");
+    for (const auto & o : expert_trace_ops) {
+        fprintf(f, "%" PRIu64 ",%d,%d,%d,%" PRId64 ",%" PRId64 ",%s,%s\n", o.invocation, o.layer, o.gpu, o.node, o.t0, o.t1, o.op.c_str(), o.name.c_str());
+    }
+    fclose(f);
 }
 
 ggml_status llama_context::graph_compute(
@@ -2949,7 +3064,15 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    ggml_status status;
+    try {
+        status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    } catch (const std::exception & e) {
+        // e.g. the expert executor failed inside the eval callback
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        ggml_backend_sched_synchronize(sched.get());
+        status = GGML_STATUS_FAILED;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }

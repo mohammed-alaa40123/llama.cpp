@@ -400,6 +400,31 @@ private:
     uint64_t expert_invocation = 0;
     static bool expert_eval(ggml_tensor * tensor, bool ask, void * data);
 
+    // expert executor trace, enabled with LLAMA_EP_TRACE=<csv path>; times are ggml_time_us (CLOCK_MONOTONIC)
+    // LLAMA_EP_OPPROF=1 also times each branch op, and runs the branches one after the other (diagnostic only)
+    struct expert_trace_call {
+        uint64_t invocation;
+        int32_t  layer, n_tokens, top_k, n_cpu, n_gpu;
+        int64_t  t_enter, t_policy, t_prep_cpu, t_prep_gpu;
+        size_t   bytes_cpu, bytes_gpu;
+        int64_t  t_gpu_submit0, t_gpu_submit1, t_gpu_sync, t_gpu_read;
+        int64_t  t_cpu0, t_cpu1, t_cpu_read;
+        int64_t  t_join, t_out, t_cleanup;
+        std::string assignment; // per [token, slot]: expert id and c/g
+    };
+    struct expert_trace_op {
+        uint64_t invocation;
+        int32_t  layer, gpu, node;
+        int64_t  t0, t1;
+        std::string op, name;
+    };
+    std::string expert_trace_path;
+    bool expert_opprof = false;
+    bool expert_serial = false; // LLAMA_EP_SERIAL=1: GPU branch, then CPU branch (diagnostic control)
+    std::vector<expert_trace_call> expert_trace_calls;
+    std::vector<expert_trace_op>   expert_trace_ops;
+    void expert_trace_write() const;
+
     std::vector<ggml_backend_ptr> backends;
 
     // training

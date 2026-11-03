@@ -4,6 +4,7 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
+#include "expert-policy.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
@@ -2708,12 +2709,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
-        {"--expert-policy"}, "{all-cpu,all-gpu,alternating,expert-id,rotating}",
-        "assign routed experts to CPU or GPU (experimental)",
+        {"--expert-policy"}, "{all-cpu,all-gpu,alternating,expert-id,rotating,cpu-first-N,cpu-last-N}",
+        "assign routed experts to CPU or GPU (experimental); cpu-first-N/cpu-last-N put the first/last N top-k slots of each token on CPU",
         [](common_params & params, const std::string & value) {
-            if (value != "all-cpu" && value != "all-gpu" && value != "alternating" && value != "expert-id" && value != "rotating") {
-                throw std::invalid_argument("unknown expert policy: " + value);
-            }
+            common_expert_policy_from_name(value); // throws on unknown names
             params.expert_policy = value;
         }
     ));
