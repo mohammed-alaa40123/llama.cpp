@@ -37,7 +37,8 @@ mkdir -p "${EP_LOG_DIR:-ep-smoke-results}"
 out="${EP_LOG_DIR:-ep-smoke-results}"
 for policy in all-cpu all-gpu alternating rotating; do
     echo "== EP policy: ${policy} on ${EP_DEVICE} =="
-    "${BIN}" --device "${EP_DEVICE}" -ngl 0 \
+    # --no-host: on Mali the GPU host buffer made the CPU path ~16x slower
+    "${BIN}" --device "${EP_DEVICE}" -ngl 0 --no-host \
         -m "${EP_MODEL}" --expert-policy "${policy}" \
         -t "${EP_THREADS}" -n "${EP_TOKENS}" -p "${EP_PROMPT}" \
         --temp 0 > "${out}/${policy}.log" 2>&1 || {
