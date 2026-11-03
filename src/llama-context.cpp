@@ -2869,8 +2869,13 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
             LLAMA_LOG_DEBUG("ep_upload layer=%d backend=%s type=%s bytes=%zu\n", il, ggml_backend_name(backend), ggml_type_name(in.first->type), in.second.size());
         }
         for (int i = 0; i < ggml_graph_n_nodes(branch.graph); ++i) {
-            if (!ggml_backend_supports_op(backend, ggml_graph_node(branch.graph, i))) {
-                throw std::runtime_error(std::string("expert branch operation unsupported on assigned backend: ")+ggml_op_name(ggml_graph_node(branch.graph, i)->op));
+            auto * op = ggml_graph_node(branch.graph, i);
+            if (!ggml_backend_supports_op(backend, op)) {
+                throw std::runtime_error(format(
+                    "expert branch unsupported backend=%s op=%s type=%s shape=[%lld,%lld,%lld,%lld]",
+                    ggml_backend_name(backend), ggml_op_name(op->op), ggml_type_name(op->type),
+                    (long long) op->ne[0], (long long) op->ne[1],
+                    (long long) op->ne[2], (long long) op->ne[3]));
             }
         }
     }
