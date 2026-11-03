@@ -2779,8 +2779,13 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
         LLAMA_LOG_DEBUG("ep_route layer=%d token=%lld slot=%lld expert=%d backend=%s\n", il,
             (long long) (i/k), (long long) (i%k), selected[i], gpu[i] ? ggml_backend_name(backend_gpu) : "CPU");
     }
-    ggml_backend_ptr cpu(ggml_backend_cpu_init());
-    ggml_backend_cpu_set_n_threads(cpu.get(), ctx.cparams.n_threads);
+    if (!ctx.expert_cpu_backend) {
+        ctx.expert_cpu_backend.reset(ggml_backend_cpu_init());
+        if (!ctx.expert_cpu_backend) {
+            throw std::runtime_error("expert CPU backend initialization failed");
+        }
+    }
+    ggml_backend_cpu_set_n_threads(ctx.expert_cpu_backend.get(), ctx.cparams.n_threads);
     struct branch {
         ggml_context_ptr meta;
         ggml_backend_buffer_ptr buffer;
@@ -2854,7 +2859,7 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
             ggml_build_forward_expand(branch.graph, out);
             branch.outputs.emplace_back(out, i);
         }
-        auto * backend = b ? backend_gpu : cpu.get();
+        auto * backend = b ? backend_gpu : ctx.expert_cpu_backend.get();
         branch.buffer.reset(ggml_backend_alloc_ctx_tensors(meta, backend));
         if (!branch.buffer) {
             throw std::runtime_error("expert backend allocation failed");
@@ -2887,7 +2892,7 @@ bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
                 signal_submission();
                 return;
             }
-            auto * backend = b ? backend_gpu : cpu.get();
+            auto * backend = b ? backend_gpu : ctx.expert_cpu_backend.get();
             const int64_t start = ggml_time_us();
             status[b] = ggml_backend_graph_compute_async(backend, branch.graph);
             signal_submission();
