@@ -525,7 +525,7 @@ llama_context::llama_context(
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
+            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty() && !model.no_host()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 const auto & dev = model.devices[0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);

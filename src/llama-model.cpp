@@ -2464,6 +2464,10 @@ bool llama_model::no_alloc() const {
     return params.no_alloc;
 }
 
+bool llama_model::no_host() const {
+    return params.no_host;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
